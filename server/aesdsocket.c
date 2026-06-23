@@ -10,11 +10,162 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <sys/queue.h>
+#include <time.h>
 
 #define PORT 9000
 
 // Flag set by signal handler to request graceful exit
 static volatile sig_atomic_t exit_requested = 0;
+struct thread_info
+{
+    int client_fd;
+    pthread_t thread_id;
+    bool t_complete;
+    SLIST_ENTRY(thread_info) next;
+};
+
+// SLIST_HEAD(name, type): define a singly-linked list head structure
+SLIST_HEAD(thread_list, thread_info) thread_head = SLIST_HEAD_INITIALIZER(thread_head);
+
+// pthread_mutex_t: mutex to protect access to the file data
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// timer_thread: appends an RFC 2822 timestamp to the data file every 10 seconds.
+// Started after daemonization so it runs only in the final process (child or non-daemon).
+static void *timer_thread(void *arg)
+{
+    (void)arg;
+    int seconds = 0;
+    while (!exit_requested) {
+        sleep(1); // wake every second to stay responsive to exit_requested
+        if (exit_requested) break;
+        if (++seconds < 10) continue;
+        seconds = 0;
+
+        // Build RFC 2822 timestamp: "timestamp:<day>, <DD> <Mon> <YYYY> <HH>:<MM>:<SS> <±HHMM>\n"
+        time_t now = time(NULL);
+        struct tm tm_buf;
+        localtime_r(&now, &tm_buf);
+        char ts[64];
+        // strftime format: "timestamp:%a, %d %b %Y %H:%M:%S %z\n"
+        //   %a = abbreviated weekday,  %d = day of month (01-31)
+        //   %b = abbreviated month,    %Y = 4-digit year
+        //   %H:%M:%S = 24-hour time,   %z = UTC offset (+0000)
+        size_t n = strftime(ts, sizeof(ts), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", &tm_buf);
+        if (n == 0) continue; // buffer too small — should never happen
+
+        pthread_mutex_lock(&file_mutex);
+        FILE *f = fopen("/var/tmp/aesdsocketdata", "a");
+        if (f) {
+            fputs(ts, f);
+            fclose(f);
+        }
+        pthread_mutex_unlock(&file_mutex);
+    }
+    return NULL;
+}
+
+void* handle_client(void* arg)
+{
+    struct thread_info *tinfo = (struct thread_info*)arg;
+    int client_fd = tinfo->client_fd;
+
+    // Step 5: Receive data; append each newline-terminated packet to file.
+    // dup(fd): duplicate client_fd so fdopen owns the copy and client_fd stays open for send()
+    int dup_fd = dup(client_fd);
+    if (dup_fd < 0) {
+        perror("dup failed");
+        close(client_fd);
+        return NULL;
+    }
+
+    // fdopen(fd, mode): wrap a file descriptor into a buffered FILE* stream
+    //   fd   = dup_fd: duplicate socket fd (fdopen takes ownership — fclose closes it)
+    //   mode = "r"   : open for reading
+    FILE *sock_stream = fdopen(dup_fd, "r");
+    if (!sock_stream) {
+        perror("fdopen failed");
+        close(dup_fd);
+        close(client_fd);
+        return NULL;
+    }
+
+    // getline(lineptr, n, stream): read one line including '\n' from stream
+    //   lineptr = &line      : malloc'd buffer, grown automatically via realloc
+    //   n       = &len       : current buffer capacity, updated on each realloc
+    //   stream  = sock_stream: FILE* to read from
+    //   returns bytes read; -1 on EOF or error
+    char *line = NULL; // getline allocates this buffer
+    size_t len  = 0;   // getline sets and updates this capacity
+
+    while (getline(&line, &len, sock_stream) != -1) {
+        // Lock the mutex to ensure exclusive access to the file
+        pthread_mutex_lock(&file_mutex);
+
+        // fopen(path, "a"): open for appending; creates the file if it doesn't exist
+        FILE *file = fopen("/var/tmp/aesdsocketdata", "a");
+        if (!file) {
+            perror("fopen failed");
+            pthread_mutex_unlock(&file_mutex);
+            break;
+        }
+        // fputs(str, stream): write the line (including '\n') to the file
+        fputs(line, file);
+        fclose(file);
+
+        // Step 6: Send full file content back to client immediately after each complete packet.
+        // fopen(path, "r"): open file for reading
+        FILE *rfile = fopen("/var/tmp/aesdsocketdata", "r");
+        if (!rfile) {
+            perror("fopen for read failed");
+            pthread_mutex_unlock(&file_mutex);
+            break;
+        }
+        // fseek(file, offset, whence): move the file position pointer
+        //   offset = 0        : no offset
+        //   whence = SEEK_END : start from the end of the file
+        // ftell(file): return current position = total file size in bytes
+        fseek(rfile, 0, SEEK_END);
+        long file_size = ftell(rfile);
+        // rewind(file): reset file position pointer back to the beginning for reading
+        rewind(rfile);
+
+        // malloc(size): allocate file_size bytes on the heap to hold the file content
+        char *file_content = malloc(file_size);
+        if (!file_content) {
+            perror("malloc failed");
+            fclose(rfile);
+            pthread_mutex_unlock(&file_mutex);
+            break;
+        }
+        // fread(ptr, size, nmemb, stream): read file content into buffer
+        //   ptr    = file_content : destination buffer
+        //   size   = 1            : read 1 byte per element
+        //   nmemb  = file_size    : number of elements (total bytes) to read
+        //   stream = rfile        : source FILE* stream
+        fread(file_content, 1, file_size, rfile);
+        fclose(rfile);
+
+        // send(sockfd, buf, len, flags): transmit data to the client
+        //   sockfd = client_fd    : connected client socket
+        //   buf    = file_content : data buffer to send
+        //   len    = file_size    : number of bytes to send
+        //   flags  = 0            : normal blocking send, no special options
+        send(client_fd, file_content, file_size, 0);
+        free(file_content);
+        pthread_mutex_unlock(&file_mutex);
+    }
+
+    free(line);          // free buffer allocated by getline
+    fclose(sock_stream); // closes dup_fd; client_fd remains open
+
+    close(client_fd);
+    // syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(client_addr.sin_addr));
+    return NULL;
+}
 
 // signal_handler: called on SIGINT or SIGTERM
 //   sig = signal number received (unused, but required by sigaction API)
@@ -69,6 +220,7 @@ int main(int argc, char *argv[])
     // Without this, restarting the server within ~2 min of a previous run causes "Address already in use"
     int opt = 1;
     setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(socket_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 
     // Step 2: Bind the socket to an address and port
     struct sockaddr_in server_addr, client_addr;
@@ -139,6 +291,17 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Start the timestamp timer thread here — after fork — so it runs only in the
+    // final process (daemon child or non-daemon process). Threads created before
+    // fork() are not inherited by the child.
+    pthread_t timer_tid;
+    if (pthread_create(&timer_tid, NULL, timer_thread, NULL) != 0) {
+        perror("pthread_create timer failed");
+        close(socket_fd);
+        closelog();
+        return -1;
+    }
+
     // Step 5: Accept connections in a loop until SIGINT or SIGTERM is received
     while (!exit_requested) {
         socklen_t client_addr_len = sizeof(client_addr);
@@ -159,94 +322,42 @@ int main(int argc, char *argv[])
         //   LOG_INFO: informational severity level
         syslog(LOG_INFO, "Accepted connection from %s", inet_ntoa(client_addr.sin_addr));
 
-        // Step 5: Receive data; append each newline-terminated packet to file.
-        // dup(fd): duplicate client_fd so fdopen owns the copy and client_fd stays open for send()
-        int dup_fd = dup(client_fd);
-        if (dup_fd < 0) {
-            perror("dup failed");
+        struct thread_info *tinfo = (struct thread_info*)malloc(sizeof(struct thread_info));
+        tinfo->t_complete = false;
+        tinfo->client_fd = client_fd;
+
+        if(pthread_create(&tinfo->thread_id, NULL, handle_client, tinfo) != 0)
+        {
+            perror("pthread_create failed");
             close(client_fd);
+            free(tinfo);
             continue;
         }
 
-        // fdopen(fd, mode): wrap a file descriptor into a buffered FILE* stream
-        //   fd   = dup_fd: duplicate socket fd (fdopen takes ownership — fclose closes it)
-        //   mode = "r"   : open for reading
-        FILE *sock_stream = fdopen(dup_fd, "r");
-        if (!sock_stream) {
-            perror("fdopen failed");
-            close(dup_fd);
-            close(client_fd);
-            continue;
+        // Add the new thread info to the list
+        SLIST_INSERT_HEAD(&thread_head, tinfo, next);
+
+        // Traverse the list and clean up completed threads
+        struct thread_info *tinfo_iter;
+        SLIST_FOREACH(tinfo_iter, &thread_head, next) {
+            if (tinfo_iter->t_complete) {
+                pthread_join(tinfo_iter->thread_id, NULL);
+                SLIST_REMOVE(&thread_head, tinfo_iter, thread_info, next);
+                free(tinfo_iter);
+                tinfo_iter = NULL; // Reset iterator to avoid using freed memory
+            }
         }
-
-        // getline(lineptr, n, stream): read one line including '\n' from stream
-        //   lineptr = &line      : malloc'd buffer, grown automatically via realloc
-        //   n       = &len       : current buffer capacity, updated on each realloc
-        //   stream  = sock_stream: FILE* to read from
-        //   returns bytes read; -1 on EOF or error
-        char *line = NULL; // getline allocates this buffer
-        size_t len  = 0;   // getline sets and updates this capacity
-
-        while (getline(&line, &len, sock_stream) != -1) {
-            // fopen(path, "a"): open for appending; creates the file if it doesn't exist
-            FILE *file = fopen("/var/tmp/aesdsocketdata", "a");
-            if (!file) {
-                perror("fopen failed");
-                break;
-            }
-            // fputs(str, stream): write the line (including '\n') to the file
-            fputs(line, file);
-            fclose(file);
-
-            // Step 6: Send full file content back to client immediately after each complete packet.
-            // fopen(path, "r"): open file for reading
-            FILE *rfile = fopen("/var/tmp/aesdsocketdata", "r");
-            if (!rfile) {
-                perror("fopen for read failed");
-                break;
-            }
-            // fseek(file, offset, whence): move the file position pointer
-            //   offset = 0        : no offset
-            //   whence = SEEK_END : start from the end of the file
-            // ftell(file): return current position = total file size in bytes
-            fseek(rfile, 0, SEEK_END);
-            long file_size = ftell(rfile);
-            // rewind(file): reset file position pointer back to the beginning for reading
-            rewind(rfile);
-
-            // malloc(size): allocate file_size bytes on the heap to hold the file content
-            char *file_content = malloc(file_size);
-            if (!file_content) {
-                perror("malloc failed");
-                fclose(rfile);
-                break;
-            }
-            // fread(ptr, size, nmemb, stream): read file content into buffer
-            //   ptr    = file_content : destination buffer
-            //   size   = 1            : read 1 byte per element
-            //   nmemb  = file_size    : number of elements (total bytes) to read
-            //   stream = rfile        : source FILE* stream
-            fread(file_content, 1, file_size, rfile);
-            fclose(rfile);
-
-            // send(sockfd, buf, len, flags): transmit data to the client
-            //   sockfd = client_fd    : connected client socket
-            //   buf    = file_content : data buffer to send
-            //   len    = file_size    : number of bytes to send
-            //   flags  = 0            : normal blocking send, no special options
-            send(client_fd, file_content, file_size, 0);
-            free(file_content);
-        }
-
-        free(line);          // free buffer allocated by getline
-        fclose(sock_stream); // closes dup_fd; client_fd remains open
-
-        close(client_fd);
-        syslog(LOG_INFO, "Closed connection from %s", inet_ntoa(client_addr.sin_addr));
     }
 
-    // Graceful shutdown: log exit message, clean up resources, delete data file
+    struct thread_info *tinfo_iter;
+    SLIST_FOREACH(tinfo_iter, &thread_head, next) {
+        pthread_join(tinfo_iter->thread_id, NULL);
+        SLIST_REMOVE(&thread_head, tinfo_iter, thread_info, next);
+        free(tinfo_iter);
+    }
+    // Graceful shutdown: join timer and client threads, then clean up
     syslog(LOG_INFO, "Caught signal, exiting");
+    pthread_join(timer_tid, NULL);
     close(socket_fd);
     // unlink(path): delete the file from the filesystem
     unlink("/var/tmp/aesdsocketdata");
